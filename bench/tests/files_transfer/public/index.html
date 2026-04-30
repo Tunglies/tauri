@@ -6,24 +6,95 @@
     <title>Welcome to Tauri!</title>
   </head>
   <body>
-    <h1>Welcome to Tauri!</h1>
-
     <script>
-      window.addEventListener('DOMContentLoaded', (event) => {
-        window.__TAURI__.core
-          .invoke('read_file')
-          .then((_data) => {
-            // success
-            window.__TAURI__.core.invoke('app_should_close', {
-              exitCode: 0
-            })
+      function assertArrayBuffer(data) {
+        if (!(data instanceof ArrayBuffer)) {
+          throw new Error(`unsupported response type: ${typeof data}`)
+        }
+        return data
+      }
+
+      function expectedByte(index) {
+        let value = (index ^ 0x9e3779b9) >>> 0
+        value = (value ^ (value >>> 16)) >>> 0
+        value = Math.imul(value, 0x7feb352d) >>> 0
+        value = (value ^ (value >>> 15)) >>> 0
+        value = Math.imul(value, 0x846ca68b) >>> 0
+        value = (value ^ (value >>> 16)) >>> 0
+        return (value & 0xff) | 1
+      }
+
+      function checksum(bytes, expectedLength, generated) {
+        if (bytes.byteLength !== expectedLength) {
+          throw new Error(
+            `unexpected length ${bytes.byteLength}, expected ${expectedLength}`
+          )
+        }
+
+        if (!generated || expectedLength === 0) {
+          return bytes.byteLength
+        }
+
+        let sum = 0
+        const step = Math.max(1, Math.floor(expectedLength / 257))
+        for (let index = 0; index < expectedLength; index += step) {
+          const value = bytes[index]
+          const expected = expectedByte(index)
+          if (value !== expected) {
+            throw new Error(
+              `unexpected byte at ${index}: got ${value}, expected ${expected}`
+            )
+          }
+          sum = (sum + value) >>> 0
+        }
+
+        const lastIndex = expectedLength - 1
+        const lastValue = bytes[lastIndex]
+        const expectedLastValue = expectedByte(lastIndex)
+        if (lastValue !== expectedLastValue) {
+          throw new Error(
+            `unexpected byte at ${lastIndex}: got ${lastValue}, expected ${expectedLastValue}`
+          )
+        }
+
+        return (sum + lastValue) >>> 0
+      }
+
+      window.addEventListener('DOMContentLoaded', async () => {
+        const started = performance.now()
+        let totalBytes = 0
+        let totalChecksum = 0
+
+        try {
+          const config = await window.__TAURI__.core.invoke('bench_config')
+          const iterations = config.iterations || 1
+
+          for (let i = 0; i < iterations; i++) {
+            const data = await window.__TAURI__.core.invoke('read_file')
+            const bytes = new Uint8Array(assertArrayBuffer(data))
+            const expectedLength = config.generated
+              ? config.bytes
+              : bytes.byteLength
+
+            totalBytes += bytes.byteLength
+            totalChecksum =
+              (totalChecksum +
+                checksum(bytes, expectedLength, config.generated)) >>>
+              0
+          }
+
+          await window.__TAURI__.core.invoke('app_should_close', {
+            exitCode: 0,
+            totalBytes,
+            durationMs: performance.now() - started,
+            checksum: totalChecksum
           })
-          .catch((_error) => {
-            // error
-            window.__TAURI__.core.invoke('app_should_close', {
-              exitCode: 1
-            })
+        } catch (error) {
+          console.error(error)
+          await window.__TAURI__.core.invoke('app_should_close', {
+            exitCode: 1
           })
+        }
       })
     </script>
   </body>

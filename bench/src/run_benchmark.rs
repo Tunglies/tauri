@@ -22,21 +22,56 @@ use std::{
 
 mod utils;
 
+#[derive(Debug, Clone)]
+struct Benchmark {
+  name: String,
+  executable: String,
+  envs: Vec<(&'static str, String)>,
+}
+
+impl Benchmark {
+  fn new(name: impl Into<String>, executable: impl Into<String>) -> Self {
+    Self {
+      name: name.into(),
+      executable: executable.into(),
+      envs: Vec::new(),
+    }
+  }
+
+  fn transfer(target: &str, name: &str, bytes: usize, iterations: usize) -> Self {
+    Self {
+      name: name.into(),
+      executable: format!("../target/{target}/release/bench_files_transfer"),
+      envs: vec![
+        ("TAURI_BENCH_TRANSFER_BYTES", bytes.to_string()),
+        ("TAURI_BENCH_TRANSFER_ITERATIONS", iterations.to_string()),
+      ],
+    }
+  }
+
+  fn executable_path(&self) -> std::path::PathBuf {
+    utils::bench_root_path().join(&self.executable)
+  }
+}
+
 /// The list of examples for benchmarks
-fn get_all_benchmarks(target: &str) -> Vec<(String, String)> {
+fn get_all_benchmarks(target: &str) -> Vec<Benchmark> {
   vec![
-    (
-      "tauri_hello_world".into(),
+    Benchmark::new(
+      "tauri_hello_world",
       format!("../target/{target}/release/bench_helloworld"),
     ),
-    (
-      "tauri_cpu_intensive".into(),
+    Benchmark::new(
+      "tauri_cpu_intensive",
       format!("../target/{target}/release/bench_cpu_intensive"),
     ),
-    (
-      "tauri_3mb_transfer".into(),
-      format!("../target/{target}/release/bench_files_transfer"),
-    ),
+    Benchmark::transfer(target, "tauri_1kb_transfer", 1024, 1000),
+    Benchmark::transfer(target, "tauri_4kb_transfer", 4 * 1024, 1000),
+    Benchmark::transfer(target, "tauri_64kb_transfer", 64 * 1024, 500),
+    Benchmark::transfer(target, "tauri_1mb_transfer", 1024 * 1024, 100),
+    Benchmark::transfer(target, "tauri_3mb_transfer", 3 * 1024 * 1024, 50),
+    Benchmark::transfer(target, "tauri_8mb_transfer", 8 * 1024 * 1024, 20),
+    Benchmark::transfer(target, "tauri_32mb_transfer", 32 * 1024 * 1024, 5),
   ]
 }
 
@@ -46,11 +81,11 @@ fn run_strace_benchmarks(new_data: &mut utils::BenchResult, target: &str) -> Res
   let mut thread_count = HashMap::<String, u64>::new();
   let mut syscall_count = HashMap::<String, u64>::new();
 
-  for (name, example_exe) in get_all_benchmarks(target) {
+  for benchmark in get_all_benchmarks(target) {
     let mut file = tempfile::NamedTempFile::new()
       .context("failed to create temporary file for strace output")?;
 
-    let exe_path = utils::bench_root_path().join(&example_exe);
+    let exe_path = benchmark.executable_path();
     let exe_path_str = exe_path
       .to_str()
       .context("executable path contains invalid UTF-8")?;
@@ -59,8 +94,13 @@ fn run_strace_benchmarks(new_data: &mut utils::BenchResult, target: &str) -> Res
       .to_str()
       .context("temporary file path contains invalid UTF-8")?;
 
-    Command::new("strace")
-      .args(["-c", "-f", "-o", temp_path_str, exe_path_str])
+    let mut command = Command::new("strace");
+    command.args(["-c", "-f", "-o", temp_path_str, exe_path_str]);
+    for (key, value) in &benchmark.envs {
+      command.env(key, value);
+    }
+
+    command
       .stdout(Stdio::inherit())
       .spawn()
       .context("failed to spawn strace process")?
@@ -79,8 +119,8 @@ fn run_strace_benchmarks(new_data: &mut utils::BenchResult, target: &str) -> Res
       + strace_result.get("clone3").map(|d| d.calls).unwrap_or(0);
 
     if let Some(total) = strace_result.get("total") {
-      thread_count.insert(name.clone(), clone_calls);
-      syscall_count.insert(name, total.calls);
+      thread_count.insert(benchmark.name.clone(), clone_calls);
+      syscall_count.insert(benchmark.name, total.calls);
     }
   }
 
@@ -93,39 +133,45 @@ fn run_strace_benchmarks(new_data: &mut utils::BenchResult, target: &str) -> Res
 fn run_max_mem_benchmark(target: &str) -> Result<HashMap<String, u64>> {
   let mut results = HashMap::<String, u64>::new();
 
-  for (name, example_exe) in get_all_benchmarks(target) {
-    let benchmark_file = utils::target_dir().join(format!("mprof{name}_.dat"));
+  for benchmark in get_all_benchmarks(target) {
+    let benchmark_file = utils::target_dir().join(format!("mprof{}_.dat", benchmark.name));
     let benchmark_file_str = benchmark_file
       .to_str()
       .context("benchmark file path contains invalid UTF-8")?;
 
-    let exe_path = utils::bench_root_path().join(&example_exe);
+    let exe_path = benchmark.executable_path();
     let exe_path_str = exe_path
       .to_str()
       .context("executable path contains invalid UTF-8")?;
 
-    let proc = Command::new("mprof")
-      .args(["run", "-C", "-o", benchmark_file_str, exe_path_str])
+    let mut command = Command::new("mprof");
+    command.args(["run", "-C", "-o", benchmark_file_str, exe_path_str]);
+    for (key, value) in &benchmark.envs {
+      command.env(key, value);
+    }
+
+    let proc = command
       .stdout(Stdio::null())
       .stderr(Stdio::piped())
       .spawn()
-      .with_context(|| format!("failed to spawn mprof for benchmark {name}"))?;
+      .with_context(|| format!("failed to spawn mprof for benchmark {}", benchmark.name))?;
 
     let proc_result = proc
       .wait_with_output()
-      .with_context(|| format!("failed to wait for mprof {name}"))?;
+      .with_context(|| format!("failed to wait for mprof {}", benchmark.name))?;
 
     if !proc_result.status.success() {
       eprintln!(
-        "mprof failed for {name}: {}",
+        "mprof failed for {}: {}",
+        benchmark.name,
         String::from_utf8_lossy(&proc_result.stderr)
       );
     }
 
     if let Some(mem) = utils::parse_max_mem(benchmark_file_str)
-      .with_context(|| format!("failed to parse mprof data for {name}"))?
+      .with_context(|| format!("failed to parse mprof data for {}", benchmark.name))?
     {
-      results.insert(name, mem);
+      results.insert(benchmark.name, mem);
     }
 
     // Clean up the temporary file
@@ -179,11 +225,11 @@ fn get_binary_sizes(target_dir: &Path, target: &str) -> Result<HashMap<String, u
   let wry_size = rlib_size(target_dir, "libwry")?;
   sizes.insert("wry_rlib".to_string(), wry_size);
 
-  for (name, example_exe) in get_all_benchmarks(target) {
-    let exe_path = utils::bench_root_path().join(&example_exe);
+  for benchmark in get_all_benchmarks(target) {
+    let exe_path = benchmark.executable_path();
     let meta = std::fs::metadata(&exe_path)
       .with_context(|| format!("failed to read metadata for {}", exe_path.display()))?;
-    sizes.insert(name, meta.len());
+    sizes.insert(benchmark.name, meta.len());
   }
 
   Ok(sizes)
@@ -276,12 +322,22 @@ fn run_exec_time(target: &str) -> Result<HashMap<String, HashMap<String, f64>>> 
   let benchmarks = get_all_benchmarks(target);
   let mut benchmark_paths = Vec::new();
 
-  for (_, example_exe) in &benchmarks {
-    let exe_path = utils::bench_root_path().join(example_exe);
+  for benchmark in &benchmarks {
+    let exe_path = benchmark.executable_path();
     let exe_path_str = exe_path
       .to_str()
       .context("executable path contains invalid UTF-8")?;
-    benchmark_paths.push(exe_path_str.to_string());
+    if benchmark.envs.is_empty() {
+      benchmark_paths.push(exe_path_str.to_string());
+    } else {
+      let envs = benchmark
+        .envs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+      benchmark_paths.push(format!("env {envs} {exe_path_str}"));
+    }
   }
 
   for path in &benchmark_paths {
@@ -298,7 +354,7 @@ fn run_exec_time(target: &str) -> Result<HashMap<String, HashMap<String, f64>>> 
     .and_then(|obj| obj.get("results"))
     .and_then(|val| val.as_array())
   {
-    for ((name, _), data) in benchmarks.iter().zip(results_array.iter()) {
+    for (benchmark, data) in benchmarks.iter().zip(results_array.iter()) {
       if let Some(data_obj) = data.as_object() {
         let filtered_data: HashMap<String, f64> = data_obj
           .iter()
@@ -306,7 +362,7 @@ fn run_exec_time(target: &str) -> Result<HashMap<String, HashMap<String, f64>>> 
           .filter_map(|(key, val)| val.as_f64().map(|v| (key.clone(), v)))
           .collect();
 
-        results.insert(name.clone(), filtered_data);
+        results.insert(benchmark.name.clone(), filtered_data);
       }
     }
   }
